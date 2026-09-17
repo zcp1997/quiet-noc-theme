@@ -227,6 +227,23 @@ function fleetRemainingValue(nodes) {
   }
   return { value, count };
 }
+function fleetMonthlySpend(nodes, now = Date.now()) {
+  const cycleMonths = {
+    monthly: 1, quarterly: 3, semi_annual: 6, semiannual: 6,
+    halfyearly: 6, yearly: 12, annual: 12, biennial: 24,
+    triennial: 36, quinquennial: 60,
+  };
+  let value = 0;
+  for (const node of nodes) {
+    const end = node.expires_at ? Date.parse(node.expires_at) : NaN;
+    if (Number.isFinite(end) && end <= now) continue;
+    const price = priceCNY(node);
+    const cycle = String(node.billing_cycle || '').toLowerCase();
+    const months = cycleMonths[cycle] || (billingCycleDays(cycle) / (365 / 12));
+    if (price > 0 && months > 0) value += price / months;
+  }
+  return value;
+}
 
 function sparkPath(arr, w = 220, h = 34) {
   if (!arr.length) arr = [0, 0];
@@ -422,6 +439,7 @@ function exchangeSourceLabel() {
 function summaryCards(a) {
   const rx = sparkPath(state.rxSeries), tx = sparkPath(state.txSeries);
   const remaining = fleetRemainingValue(a.nodes);
+  const monthlySpend = fleetMonthlySpend(a.nodes);
   return `<section class="summary-grid">
     <div class="summary-card" data-summary-card="nodes">
       <div class="summary-head"><span class="summary-icon status-summary">${icon('server')}</span><span>节点</span></div>
@@ -441,8 +459,11 @@ function summaryCards(a) {
       </div>
     </div>
     <div class="summary-card finance-summary" data-summary-card="finance">
-      <div class="summary-head"><span class="summary-icon">${icon('coins')}</span><span>剩余价值</span></div>
-      <div class="summary-main">${formatCNY(remaining.value)}</div>
+      <div class="summary-head"><span class="summary-icon">${icon('coins')}</span><span>费用概览</span></div>
+      <div class="finance-metrics">
+        <div class="finance-metric"><span>月支出估算</span><strong title="${formatCNY(monthlySpend)}">${formatCNY(monthlySpend)}</strong></div>
+        <div class="finance-metric"><span>剩余价值合计</span><strong title="${formatCNY(remaining.value)}">${formatCNY(remaining.value)}</strong></div>
+      </div>
       <div class="summary-sub">${remaining.count} 个计费节点 · ${exchangeSourceLabel()}</div>
     </div>
   </section>`;
