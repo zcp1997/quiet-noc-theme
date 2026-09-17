@@ -432,10 +432,6 @@ function nodeListTable(nodes) {
   return `<div class="node-list-wrap"><table class="node-table"><thead><tr><th>节点</th><th>状态</th><th>CPU</th><th>内存</th><th>硬盘</th><th>实时网速</th><th>今日流量</th><th>到期</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
-function exchangeSourceLabel() {
-  return state.exchangeSource === 'network' ? '今日汇率' : state.exchangeSource === 'cache' ? '今日汇率缓存' : state.exchangeSource === 'stale-cache' ? '缓存汇率' : '备用汇率';
-}
-
 function summaryCards(a) {
   const rx = sparkPath(state.rxSeries), tx = sparkPath(state.txSeries);
   const remaining = fleetRemainingValue(a.nodes);
@@ -464,7 +460,6 @@ function summaryCards(a) {
         <div class="finance-metric"><span>月支出估算</span><strong title="${formatCNY(monthlySpend)}">${formatCNY(monthlySpend)}</strong></div>
         <div class="finance-metric"><span>剩余价值合计</span><strong title="${formatCNY(remaining.value)}">${formatCNY(remaining.value)}</strong></div>
       </div>
-      <div class="finance-meta"><span>${remaining.count} 个计费节点</span><span>${exchangeSourceLabel()}</span></div>
     </div>
   </section>`;
 }
