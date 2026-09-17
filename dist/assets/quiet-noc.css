@@ -275,14 +275,14 @@ svg { display: block; }
 }
 
 /* 0.3.0 refinements */
-.traffic-summary { margin-top: 8px; display: grid; gap: 7px; }
-.traffic-summary-row { display: grid; grid-template-columns: 40px 1fr 1fr; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; }
-.traffic-summary-row + .traffic-summary-row { padding-top: 7px; border-top: 1px solid var(--line); }
+.traffic-summary { margin-top: 9px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 12px; }
+.traffic-summary-column { min-width: 0; display: grid; align-content: start; gap: 7px; font-variant-numeric: tabular-nums; }
+.traffic-summary-column + .traffic-summary-column { border-left: 1px solid var(--line); padding-left: 12px; }
 .traffic-summary-label { color: var(--muted); font-size: 11px; }
-.traffic-summary-row > span:not(.traffic-summary-label) { min-width: 0; display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
-.traffic-summary-row svg { width: 13px; height: 13px; flex: 0 0 auto; }
-.traffic-summary-row strong { color: var(--text); font-size: 14px; white-space: nowrap; }
-.traffic-summary-row.total strong { font-size: 13px; }
+.traffic-summary-value { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 5px; }
+.traffic-summary-value > span { display: inline-flex; align-items: center; gap: 3px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.traffic-summary-value svg { width: 13px; height: 13px; flex: 0 0 auto; }
+.traffic-summary-value strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text); font-size: 13px; white-space: nowrap; }
 
 .metric-value { display: inline-flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
 .metric-spark { width: 38px; height: 14px; opacity: 0; overflow: visible; transform: translateY(1px); transition: opacity .14s ease; }
@@ -330,11 +330,12 @@ svg { display: block; }
 .chart-tooltip-row strong { color: var(--text); font-weight: 650; white-space: nowrap; font-variant-numeric: tabular-nums; }
 
 @media (max-width: 760px) {
-  .traffic-summary-row { grid-template-columns: 34px 1fr 1fr; gap: 5px; }
-  .traffic-summary-row strong { font-size: 12px; }
   .metric-spark { display: none; }
   .billing-pill { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
   .cpu-badge { display: none; }
+}
+@media (min-width: 441px) and (max-width: 560px) {
+  .traffic-summary-value { align-items: flex-start; flex-direction: column; gap: 2px; }
 }
 
 

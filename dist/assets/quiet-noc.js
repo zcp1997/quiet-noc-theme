@@ -450,8 +450,16 @@ function summaryCards(a) {
     <div class="summary-card summary-traffic-card" data-summary-card="traffic">
       <div class="summary-head"><span class="summary-icon">${icon('traffic')}</span><span>流量</span></div>
       <div class="traffic-summary">
-        <div class="traffic-summary-row"><span class="traffic-summary-label">今日</span><span>${icon('arrowDown')}<strong>${bytes(a.dayRx)}</strong></span><span>${icon('arrowUp')}<strong>${bytes(a.dayTx)}</strong></span></div>
-        <div class="traffic-summary-row total"><span class="traffic-summary-label">累计</span><span>${icon('arrowDown')}<strong>${bytes(a.totalRx)}</strong></span><span>${icon('arrowUp')}<strong>${bytes(a.totalTx)}</strong></span></div>
+        <div class="traffic-summary-column">
+          <span class="traffic-summary-label">今日</span>
+          <div class="traffic-summary-value"><span>${icon('arrowDown')}下载</span><strong>${bytes(a.dayRx)}</strong></div>
+          <div class="traffic-summary-value"><span>${icon('arrowUp')}上传</span><strong>${bytes(a.dayTx)}</strong></div>
+        </div>
+        <div class="traffic-summary-column">
+          <span class="traffic-summary-label">累计</span>
+          <div class="traffic-summary-value"><span>${icon('arrowDown')}下载</span><strong>${bytes(a.totalRx)}</strong></div>
+          <div class="traffic-summary-value"><span>${icon('arrowUp')}上传</span><strong>${bytes(a.totalTx)}</strong></div>
+        </div>
       </div>
     </div>
     <div class="summary-card finance-summary" data-summary-card="finance">
