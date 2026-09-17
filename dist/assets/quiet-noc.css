@@ -102,8 +102,9 @@ svg { display: block; }
 .summary-icon svg { width: 18px; height: 18px; }
 .summary-main { margin-top: 10px; font-size: 25px; line-height: 1; font-weight: 760; letter-spacing: -.035em; font-variant-numeric: tabular-nums; }
 .summary-sub { margin-top: 9px; color: var(--muted); font-size: 12px; }
-.finance-summary { align-self: start; }
+.finance-summary { display: flex; flex-direction: column; }
 .finance-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 10px; }
+.finance-summary .finance-metrics { margin-block: auto; }
 .finance-metric { min-width: 0; }
 .finance-metric + .finance-metric { border-left: 1px solid var(--line); padding-left: 14px; margin-left: 14px; }
 .finance-metric span { display: block; color: var(--muted); font-size: 11px; white-space: nowrap; }
@@ -368,7 +369,6 @@ svg { display: block; }
 }
 @media (max-width: 760px) {
   .nodes-grid { grid-template-columns: 1fr; }
-  .summary-grid { grid-template-columns: 1fr 1fr; }
   .node-extra-left { flex-wrap: nowrap; overflow: hidden; }
   .quota-meta, .billing-pill { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
 }
