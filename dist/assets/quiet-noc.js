@@ -464,7 +464,7 @@ function summaryCards(a) {
         <div class="finance-metric"><span>月支出估算</span><strong title="${formatCNY(monthlySpend)}">${formatCNY(monthlySpend)}</strong></div>
         <div class="finance-metric"><span>剩余价值合计</span><strong title="${formatCNY(remaining.value)}">${formatCNY(remaining.value)}</strong></div>
       </div>
-      <div class="summary-sub">${remaining.count} 个计费节点 · ${exchangeSourceLabel()}</div>
+      <div class="finance-meta"><span>${remaining.count} 个计费节点</span><span>${exchangeSourceLabel()}</span></div>
     </div>
   </section>`;
 }
