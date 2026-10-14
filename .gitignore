@@ -1,0 +1,6 @@
+# macOS
+.DS_Store
+
+# Local planning notes and preview tooling, not part of the theme package
+.claude/
+docs/
