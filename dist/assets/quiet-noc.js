@@ -518,9 +518,14 @@ function nodeCard(n) {
       ${metricBlock('硬盘', diskPct, `${bytes(diskUsed, 2)} / ${bytes(diskTotal, 2)}`, trends.disk)}
     </div>
     <div class="network">
-      <span class="net-rate" title="实时下载"><span class="net-icon">${icon('arrowDown')}</span>${rate(down)}</span>
-      <span class="net-rate" title="实时上传"><span class="net-icon">${icon('arrowUp')}</span>${rate(up)}</span>
-      <span class="net-day" title="${escapeHtml(`今日 下载 ${bytes(n.day_rx || 0)} · 上传 ${bytes(n.day_tx || 0)}`)}">今日 ${bytesShort(n.day_rx || 0)} / ${bytesShort(n.day_tx || 0)}</span>
+      <div class="net-live">
+        <span class="net-rate" title="实时下载"><span class="net-icon">${icon('arrowDown')}</span>${rate(down)}</span>
+        <span class="net-rate" title="实时上传"><span class="net-icon">${icon('arrowUp')}</span>${rate(up)}</span>
+      </div>
+      <div class="net-volume">
+        <span title="${escapeHtml(`今日 下载 ${bytes(n.day_rx || 0)} · 上传 ${bytes(n.day_tx || 0)}`)}">今日 ${bytesShort(n.day_rx || 0)} / ${bytesShort(n.day_tx || 0)}</span>
+        <span title="${escapeHtml(`累计 下载 ${bytes(n.total_rx || 0)} · 上传 ${bytes(n.total_tx || 0)}`)}">累计 ${bytesShort(n.total_rx || 0)} / ${bytesShort(n.total_tx || 0)}</span>
+      </div>
     </div>
     ${latencyBlock(n)}
     <div class="node-extra">${billingMeta(n)}${trafficQuotaMeta(n)}</div>
