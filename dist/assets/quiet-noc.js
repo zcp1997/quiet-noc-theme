@@ -46,6 +46,8 @@ const state = {
     loading: false,
     error: '',
     data: null,
+    fetchedAt: 0,
+    refreshTimer: null,
   },
 };
 
@@ -400,7 +402,8 @@ function normalizeLatency(data) {
     const id = Number(row.task_id), ts = Number(row.ts);
     if (!Number.isFinite(id) || !Number.isFinite(ts)) continue;
     if (!byTask.has(id)) byTask.set(id, []);
-    byTask.get(id).push({ ts, latency: row.latency == null ? null : Number(row.latency), loss: Number(row.loss || 0) });
+    const band = Array.isArray(row.band) && row.band.length === 2 ? row.band.map(Number) : null;
+    byTask.get(id).push({ ts, latency: row.latency == null ? null : Number(row.latency), band, loss: Number(row.loss || 0) });
   }
   // Map order is the order probes first appear, which the hub sorts to the panel's order.
   return [...byTask].map(([id, points]) => ({
@@ -683,195 +686,420 @@ function renderList() {
     ${footerHtml(a)}`;
 }
 
-function statusHtml(node) {
-  const m = node.metrics || {};
-  const status = node.online ? `在线 ${duration(m.uptime)}` : `离线`;
-  return `<span class="status-pill ${node.online ? '' : 'status-offline'}"><span class="status-dot"></span>${escapeHtml(status)}</span>`;
-}
-function fact(label, value) {
-  if (value === undefined || value === null || value === '') return '';
-  return `<div class="detail-fact"><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`;
-}
-function detailPrice(node) {
-  const pieces = [];
-  const p = money(node);
-  if (p) pieces.push(p);
-  const e = expiry(node);
-  if (e) pieces.push(e.text);
-  const remain = remainingValueCNY(node);
-  if (remain > 0) pieces.push(`剩余 ${formatCNY(remain)}`);
-  return pieces.join(' · ') || '免费 / 未设置';
-}
+// ---- node detail ----
+
+const DETAIL_RANGES = [[1, '1 小时'], [6, '6 小时'], [24, '24 小时'], [168, '7 天'], [720, '30 天']];
+// A week of probe results is already the hub's most expensive history query,
+// so the latency tab stops there; resources go as far as the hub keeps them.
+const LATENCY_MAX_HOURS = 168;
+const CHART_W = 1000;
+
 function cpuName(name='') {
   return String(name).replace(/\s+CPU\s+@.*$/i, '').replace(/\s+Processor$/i, '').trim();
 }
+function detailRanges(tab) {
+  const days = Number(state.me?.history_days) || 30;
+  const cap = Math.min(days * 24, tab === 'latency' ? LATENCY_MAX_HOURS : Infinity);
+  const ranges = DETAIL_RANGES.filter(([h]) => h <= cap);
+  return ranges.length ? ranges : DETAIL_RANGES.slice(0, 1);
+}
+function shortTime(sec, hours) {
+  const opts = hours > 24
+    ? { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }
+    : { hour: '2-digit', minute: '2-digit', hour12: false };
+  return new Date(sec * 1000).toLocaleString('zh-CN', opts);
+}
+// Round a ceiling up to 1, 2, 2.5 or 5 of its decade so axis labels read cleanly.
+function niceCeil(v) {
+  if (!(v > 0)) return 1;
+  const p = 10 ** Math.floor(Math.log10(v));
+  const n = v / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * p;
+}
+// The same in the 1024 steps bytes() prints, so a byte axis tops out at 2 KB, not 2.05 KB.
+function niceBytesCeil(v) {
+  if (!(v > 0)) return 1024;
+  let unit = 1;
+  while (v / unit >= 1024) unit *= 1024;
+  return niceCeil(v / unit) * unit;
+}
 
-function niceCpuTop(max) {
-  if (max <= 4) return 4;
-  return Math.min(100, Math.ceil(max / 10) * 10);
+function detailHeadInner(node) {
+  const m = node.metrics || {};
+  const seen = node.last_seen ? new Date(node.last_seen * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+  const status = node.online ? `运行 ${duration(m.uptime)}` : `离线${seen ? ` · 最后在线 ${seen}` : ''}`;
+  const virt = node.virt && node.virt !== 'none' ? String(node.virt).toUpperCase() : '';
+  const meta = [region(node), shortOS(node.os), shortCpuName(node.cpu_name), virt, node.arch].filter(Boolean).join(' · ');
+  return `<div class="detail-title-row"><h1>${escapeHtml(node.name || `Node ${node.id}`)}</h1><span class="detail-status${node.online ? '' : ' is-offline'}">${escapeHtml(status)}</span></div>
+    <div class="detail-meta">${escapeHtml(meta)}</div>`;
 }
-function chartSegments(rows, getter, minTs, maxTs, minY, maxY, w=1000, h=160) {
-  const segs = [];
-  let cur = [];
-  const yRange = Math.max(1e-9, maxY - minY);
-  for (const row of rows) {
-    const raw = getter(row);
-    const v = raw === null || raw === undefined ? NaN : Number(raw);
-    if (!Number.isFinite(v)) {
-      if (cur.length) segs.push(cur), cur = [];
-      continue;
+
+// Live band: the same rhythm as the overview band -- caption, value, meter, footnote.
+function liveCell(caption, value, { meter = null, tone = '', foot = '', title = '' } = {}) {
+  const bar = meter === null ? '<div class="live-meter is-empty"></div>' : `<div class="live-meter"><span style="width:${clamp(meter)}%"></span></div>`;
+  return `<div class="live-cell ${tone}"${title ? ` title="${escapeHtml(title)}"` : ''}><div class="live-cap">${escapeHtml(caption)}</div><div class="live-value">${escapeHtml(value)}</div>${bar}<div class="live-foot">${escapeHtml(foot)}</div></div>`;
+}
+function detailLiveInner(node) {
+  const m = node.online ? node.metrics : null;
+  const memTotal = Number(m?.mem_total || node.mem_total || 0);
+  const diskTotal = Number(m?.disk_total || node.disk_total || 0);
+  const swapTotal = Number(m?.swap_total || node.swap_total || 0);
+  const ratio = (used, total) => total ? Number(used || 0) / total * 100 : 0;
+  const cpu = Number(m?.cpu || 0), mem = ratio(m?.mem_used, memTotal), disk = ratio(m?.disk_used, diskTotal);
+  const none = '—';
+  const load = (m?.load || []).map(v => Number(v || 0).toFixed(2));
+  const swap = swapTotal ? `swap ${m ? bytes(m.swap_used || 0) : none}` : 'swap 未启用';
+  return [
+    liveCell(`CPU ${node.cpu_cores || 0} 核`, m ? pct(cpu) : none, { meter: m ? cpu : 0, tone: m ? metricClass(cpu) : '', foot: `负载 ${load.length ? load.join(' / ') : none}`, title: 'Load Average · 1 / 5 / 15 分钟' }),
+    liveCell('内存', m ? pct(mem) : none, { meter: m ? mem : 0, tone: m ? metricClass(mem) : '', foot: `${m ? bytes(m.mem_used, 2) : none} / ${bytes(memTotal, 2)} · ${swap}`, title: swapTotal ? `swap 总量 ${bytes(swapTotal)}` : '' }),
+    liveCell('硬盘', m ? pct(disk) : none, { meter: m ? disk : 0, tone: m ? metricClass(disk) : '', foot: `${m ? bytes(m.disk_used, 2) : none} / ${bytes(diskTotal, 2)}` }),
+    liveCell('下载', m ? rate(m.net_rx) : none, { foot: `今日 ${bytes(node.day_rx || 0)}` }),
+    liveCell('上传', m ? rate(m.net_tx) : none, { foot: `今日 ${bytes(node.day_tx || 0)}` }),
+    liveCell('TCP 连接', m ? String(m.tcp ?? 0) : none, { foot: m ? `UDP ${m.udp ?? 0} · ${m.procs ?? 0} 进程` : `UDP ${none} · 进程 ${none}` }),
+  ].join('');
+}
+
+function specRow(label, value, { tone = '', title = '' } = {}) {
+  if (value === undefined || value === null || value === '') return '';
+  return `<div class="spec-row"><dt>${escapeHtml(label)}</dt><dd class="${tone}" title="${escapeHtml(title || value)}">${escapeHtml(value)}</dd></div>`;
+}
+function specGroup(title, rows) {
+  const body = rows.join('');
+  return body ? `<section class="spec-group"><h3>${escapeHtml(title)}</h3><dl>${body}</dl></section>` : '';
+}
+function detailSpecsInner(node) {
+  const pair = (rx, tx) => `↓ ${bytes(rx || 0)} · ↑ ${bytes(tx || 0)}`;
+  const limit = Number(node.traffic_limit || 0);
+  const quota = trafficPercent(node);
+  const mode = { up: '仅上传', down: '仅下载', max: '取较大值', sum: '上下行合计' }[String(node.traffic_mode || 'sum').toLowerCase()] || '上下行合计';
+  const exp = expiry(node);
+  const remain = remainingValueCNY(node);
+  const virt = node.virt && node.virt !== 'none' ? String(node.virt).toUpperCase() : '';
+  const address = [node.ipv4 || node.ip, node.ipv6].filter(Boolean).join(' · ');
+  return [
+    specGroup('系统', [
+      specRow('发行版', shortOS(node.os), { title: node.os }),
+      specRow('内核', node.kernel),
+      specRow('架构', [node.arch, virt].filter(Boolean).join(' · ')),
+      specRow('Agent', node.agent_version ? `v${node.agent_version}` : ''),
+      specRow('地址', address),
+    ]),
+    specGroup('硬件', [
+      specRow('CPU', node.cpu_name ? `${cpuName(node.cpu_name)} × ${node.cpu_cores || 0}` : `${node.cpu_cores || 0} 核`),
+      specRow('内存', bytes(node.mem_total || 0)),
+      specRow('Swap', Number(node.swap_total || 0) > 0 ? bytes(node.swap_total) : '未启用'),
+      specRow('硬盘', bytes(node.disk_total || 0)),
+    ]),
+    specGroup('流量', [
+      specRow('今日', pair(node.day_rx, node.day_tx)),
+      specRow('本月', pair(node.month_rx, node.month_tx)),
+      specRow('累计', pair(node.total_rx, node.total_tx)),
+      limit > 0 ? specRow('配额', `${bytes(monthUsage(node))} / ${bytes(limit)} · ${formatNumber(quota, quota < 10 ? 1 : 0)}%`, { tone: quota >= 95 ? 'danger' : quota >= 80 ? 'warn' : '', title: `计量方式：${mode}` }) : '',
+      Number(node.traffic_reset_day || 0) > 0 ? specRow('重置', `每月 ${node.traffic_reset_day} 日`) : '',
+    ]),
+    specGroup('账单', [
+      specRow('价格', money(node) || '未设置'),
+      specRow('到期', exp ? `${exp.text} · ${String(node.expires_at).slice(0, 10)}` : '长期', { tone: exp?.cls === 'urgent' ? 'danger' : '' }),
+      remain > 0 ? specRow('剩余价值', formatCNY(remain)) : '',
+    ]),
+  ].join('');
+}
+
+// ---- detail charts ----
+// One renderer for every history panel. A model is
+//   { id, name, rows: [{ts, ...}], step, start, end, hours, height,
+//     yMin, yMax, scale?, yFormat, series: [{ get, band?, tone }], drops?, idle, at }
+// where `idle` is the header shown at rest and `at(row)` the header while the
+// pointer is over that row's time. Every panel on the page shares one window,
+// so one pointer position maps to the same moment in all of them.
+function seriesRuns(rows, get, step) {
+  const out = [];
+  let run = [], prev = null;
+  for (const r of rows) {
+    const v = get(r);
+    const ok = v !== null && v !== undefined && Number.isFinite(v);
+    if (!ok || (prev !== null && r.ts - prev > step * 1.5)) { if (run.length) out.push(run); run = []; }
+    if (ok) run.push(r);
+    prev = r.ts;
+  }
+  if (run.length) out.push(run);
+  return out;
+}
+// `scale: 'sqrt'` compresses the top of the axis: network bursts can sit far
+// above the mean, and on a linear axis the means would flatten into the floor.
+const scaleFn = (model) => model.scale === 'sqrt' ? v => Math.sqrt(Math.max(0, v)) : v => v;
+function chartPaths(model) {
+  const { rows, step, start, end, height: h } = model;
+  const f = scaleFn(model);
+  const lo = f(model.yMin || 0), span = Math.max(1e-9, f(model.yMax) - lo);
+  const x = ts => ((ts - start) / (end - start) * CHART_W).toFixed(1);
+  const y = v => (h - 1 - Math.min(1, Math.max(0, (f(v) - lo) / span)) * (h - 2)).toFixed(1);
+  let bands = '', lines = '';
+  for (const s of model.series) {
+    for (const run of seriesRuns(rows, s.get, step)) {
+      if (s.band) {
+        const top = run.map(r => `${x(r.ts)},${y(s.band(r)[1])}`);
+        const bottom = run.map(r => `${x(r.ts)},${y(s.band(r)[0])}`).reverse();
+        if (run.length > 1) bands += `<path class="c-band ${s.tone}" d="M${top.join('L')}L${bottom.join('L')}Z"/>`;
+      }
+      // A lone point still gets a short stroke so it is visible.
+      const d = run.length > 1 ? `M${run.map(r => `${x(r.ts)},${y(s.get(r))}`).join('L')}` : `M${x(run[0].ts)},${y(s.get(run[0]))}h3`;
+      lines += `<path class="c-line ${s.tone}" d="${d}"/>`;
     }
-    const x = maxTs === minTs ? 0 : ((Number(row.ts) - minTs) / (maxTs - minTs)) * w;
-    const y = h - 4 - ((v - minY) / yRange) * (h - 8);
-    cur.push([x, Math.max(4, Math.min(h - 4, y))]);
   }
-  if (cur.length) segs.push(cur);
-  return segs;
+  const drops = (model.drops || []).map(r => `M${x(r.ts)},${h}V${h - 6}`).join('');
+  return `${bands}${lines}${drops ? `<path class="c-drop" d="${drops}"/>` : ''}`;
 }
-function pathFromPoints(points) {
-  return points.map((p,i) => `${i ? 'L':'M'}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join(' ');
-}
-function nearestSeriesValue(rows, getter, targetTs) {
-  let best = null, bestDist = Infinity;
-  for (const row of rows) {
-    const raw = getter(row);
-    const value = raw === null || raw === undefined ? NaN : Number(raw);
-    if (!Number.isFinite(value)) continue;
-    const dist = Math.abs(Number(row.ts) - targetTs);
-    if (dist < bestDist) { bestDist = dist; best = { row, value }; }
-  }
-  return best;
-}
-function historyChart(rows, series, opts={}) {
-  if (!rows?.length) return '<div class="chart-empty">这段时间没有历史数据</div>';
-  const normalized = rows.map(r => ({...r, ts:Number(r.ts || 0) * (Number(r.ts || 0) < 1e12 ? 1000 : 1)})).filter(r=>Number.isFinite(r.ts)).sort((a,b)=>a.ts-b.ts);
-  if (!normalized.length) return '<div class="chart-empty">这段时间没有历史数据</div>';
-  const minTs = normalized[0].ts, maxTs = normalized[normalized.length-1].ts;
-  let dataMin = Infinity, dataMax = -Infinity;
-  for (const s of series) for (const r of normalized) {
-    const raw = s.get(r);
-    const v = raw === null || raw === undefined ? NaN : Number(raw);
-    if (Number.isFinite(v)) { dataMin = Math.min(dataMin, v); dataMax = Math.max(dataMax, v); }
-  }
-  if (!Number.isFinite(dataMin) || !Number.isFinite(dataMax)) return '<div class="chart-empty">这段时间没有历史数据</div>';
-  let minY = opts.minY !== undefined ? Number(opts.minY) : 0;
-  let maxY = opts.maxY !== undefined ? Number(opts.maxY) : dataMax;
-  if (opts.autoDomain) {
-    const span = Math.max(opts.minSpan || 1, dataMax - dataMin);
-    const pad = span * .18;
-    minY = Math.max(0, dataMin - pad);
-    maxY = dataMax + pad;
-  } else if (opts.cpuDomain) {
-    minY = 0; maxY = niceCpuTop(dataMax);
-  } else if (opts.maxY === undefined) {
-    minY = Number(opts.minY || 0);
-    maxY = Math.max(Number(opts.floor || 1), dataMax * (opts.pad === false ? 1 : 1.08));
-  }
-  if (!(maxY > minY)) { maxY = minY + Math.max(1, Math.abs(minY) * .1); }
-  const lines = series.map((s, idx) => chartSegments(normalized, s.get, minTs, maxTs, minY, maxY).map(points =>
-    `<path class="history-line history-line-${idx}" d="${pathFromPoints(points)}" ${s.dash ? `stroke-dasharray="${s.dash}"` : ''}/>`
-  ).join('')).join('');
-  const id = `quiet-chart-${++state.chartSeq}`;
-  state.chartRegistry.set(id, { rows: normalized, series, minTs, maxTs, minY, maxY, opts });
-  const fmtY = opts.yLabel || (v => formatNumber(v,1));
-  const midTs = minTs + (maxTs - minTs) / 2;
-  return `<div class="history-chart" data-chart-id="${id}">
-    <div class="chart-stage">
-      <svg viewBox="0 0 1000 160" preserveAspectRatio="none" aria-hidden="true">
-        <path class="chart-grid" d="M0 0H1000M0 40H1000M0 80H1000M0 120H1000M0 160H1000"/>
-        ${lines}
-        <line class="chart-hover-line" x1="0" x2="0" y1="0" y2="160"/>
-        <rect class="chart-hitbox" x="0" y="0" width="1000" height="160"/>
+function chartPanel(model) {
+  state.chartRegistry.set(model.id, model);
+  const h = model.height, yMin = model.yMin || 0;
+  // The middle label is the value drawn at half height, whatever the scale.
+  const mid = model.scale === 'sqrt' ? ((Math.sqrt(yMin) + Math.sqrt(model.yMax)) / 2) ** 2 : (model.yMax + yMin) / 2;
+  const labels = [model.yMax, mid, yMin].map(v => `<span>${escapeHtml(model.yFormat(v))}</span>`).join('');
+  const midTs = (model.start + model.end) / 2;
+  return `<section class="chart-panel" data-chart="${model.id}">
+    <header class="chart-head"><span class="chart-name">${escapeHtml(model.name)}</span><span class="chart-read">${model.idle}</span></header>
+    <div class="chart-body">
+      <div class="chart-y" style="height:${h}px">${labels}</div>
+      <svg class="chart-svg" viewBox="0 0 ${CHART_W} ${h}" preserveAspectRatio="none" style="height:${h}px" aria-hidden="true">
+        <path class="c-grid" d="M0,0.5H${CHART_W}M0,${h / 2}H${CHART_W}M0,${h - 0.5}H${CHART_W}"/>
+        ${chartPaths(model)}
+        <line class="c-hover" x1="0" x2="0" y1="0" y2="${h}"/>
       </svg>
-      <div class="chart-y-axis"><span>${escapeHtml(fmtY(maxY))}</span><span>${escapeHtml(fmtY((minY+maxY)/2))}</span><span>${escapeHtml(fmtY(minY))}</span></div>
-      <div class="chart-tooltip" role="status"></div>
+      <div class="chart-x"><span>${escapeHtml(shortTime(model.start, model.hours))}</span><span>${escapeHtml(shortTime(midTs, model.hours))}</span><span>${escapeHtml(shortTime(model.end, model.hours))}</span></div>
     </div>
-    <div class="chart-time-axis"><span>${new Date(minTs).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}</span><span>${new Date(midTs).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}</span><span>${new Date(maxTs).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}</span></div>
-  </div>`;
+  </section>`;
 }
-function renderResourceHistory(node, data) {
-  const rows = data?.metrics || [];
-  const memTotal = Number(node.mem_total || node.metrics?.mem_total || 0);
-  return `<div class="detail-charts">
-    <section class="chart-panel"><div class="chart-title"><span>CPU</span><span>${rows.length ? `${rows.length} 个采样点` : ''}</span></div>${historyChart(rows,[{label:'CPU',get:r=>Number(r.cpu||0),format:v=>`${Number(v).toFixed(1)}%`}],{cpuDomain:true,yLabel:v=>`${formatNumber(v,0)}%`})}</section>
-    <section class="chart-panel"><div class="chart-title"><span>内存</span><span>${bytes(memTotal)}</span></div>${historyChart(rows,[{label:'内存',get:r=>Number(r.mem_used||0),format:v=>bytes(v)}],{minY:0,maxY:memTotal,pad:false,yLabel:v=>bytes(v)})}</section>
-    <section class="chart-panel"><div class="chart-title"><span>网络速率</span><span>下行 / 上行</span></div>${historyChart(rows,[{label:'下行',get:r=>Number(r.net_rx||0),format:v=>rate(v)},{label:'上行',get:r=>Number(r.net_tx||0),format:v=>rate(v),dash:'8 5'}],{floor:1024,yLabel:v=>rate(v)})}</section>
-  </div>`;
-}
-function renderLatencyHistory(data) {
-  const ping = data?.ping || [];
-  const probes = data?.probes || {};
-  const loss = data?.loss || {};
-  if (!ping.length) return '<div class="chart-empty detail-no-data">这段时间没有延迟数据</div>';
-  const ids = [...new Set(ping.map(p=>Number(p.task_id)))].filter(Number.isFinite);
-  const grouped = new Map();
-  for (const p of ping) {
-    const ts = Number(p.ts || 0);
-    if (!Number.isFinite(ts)) continue;
-    const row = grouped.get(ts) || { ts };
-    row[`p${Number(p.task_id)}`] = p.latency == null ? null : Number(p.latency);
-    row[`l${Number(p.task_id)}`] = Number(p.loss || 0);
-    grouped.set(ts, row);
+function nearestRow(rows, ts, step) {
+  let best = null, dist = Infinity;
+  for (const r of rows) {
+    const d = Math.abs(r.ts + step / 2 - ts);
+    if (d < dist) { dist = d; best = r; }
   }
-  const rows = [...grouped.values()].sort((a,b)=>a.ts-b.ts);
-  const series = ids.map((id, idx) => ({
-    label: probes[id] || `探测 ${id}`,
-    get: r => r[`p${id}`] == null ? null : Number(r[`p${id}`]),
-    format: (v, row) => `${formatNumber(v,1)} ms${Number(row?.[`l${id}`] || 0) > 0 ? ` · 丢 ${formatNumber(row[`l${id}`],1)}%` : ''}`,
-    dash: idx ? `${2+idx*2} 4` : '',
-  }));
-  const legend = ids.map((id,idx)=>`<span class="probe-chip"><i class="probe-line p${idx}"></i>${escapeHtml(probes[id] || `探测 ${id}`)}${Number(loss[id]||0)>0?` · 丢 ${formatNumber(loss[id],2)}%`:''}</span>`).join('');
-  return `<section class="chart-panel latency-panel"><div class="chart-title"><span>网络延迟</span><span>${ids.length} 个探测</span></div>${historyChart(rows,series,{autoDomain:true,minSpan:4,yLabel:v=>`${formatNumber(v,0)} ms`})}<div class="probe-legend">${legend}</div></section>`;
+  return dist <= step ? best : null;
+}
+function syncCharts(ts) {
+  document.querySelectorAll('.chart-panel[data-chart]').forEach(panel => {
+    const model = state.chartRegistry.get(panel.dataset.chart);
+    const line = panel.querySelector('.c-hover'), read = panel.querySelector('.chart-read');
+    if (!model || !line || !read) return;
+    if (ts === null) {
+      line.style.opacity = '0';
+      read.innerHTML = model.idle;
+      read.classList.remove('is-hover');
+      return;
+    }
+    const x = ((ts - model.start) / (model.end - model.start) * CHART_W).toFixed(1);
+    line.setAttribute('x1', x); line.setAttribute('x2', x); line.style.opacity = '1';
+    const row = nearestRow(model.rows, ts, model.step);
+    read.innerHTML = `<time>${escapeHtml(shortTime(row ? row.ts : ts, model.hours))}</time>${row ? model.at(row) : '无数据'}`;
+    read.classList.add('is-hover');
+  });
+}
+function bindDetailCharts() {
+  document.querySelectorAll('.chart-panel[data-chart] .chart-svg').forEach(svg => {
+    const move = (e) => {
+      const model = state.chartRegistry.get(svg.closest('[data-chart]')?.dataset.chart);
+      const rect = svg.getBoundingClientRect();
+      if (!model || !rect.width) return;
+      const f = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      syncCharts(model.start + f * (model.end - model.start));
+    };
+    svg.addEventListener('pointermove', move);
+    svg.addEventListener('pointerdown', move);
+    svg.addEventListener('pointerleave', () => syncCharts(null));
+    svg.addEventListener('pointercancel', () => syncCharts(null));
+  });
+}
+
+// Downtime from the rows' coverage. A bucket missing between two others, or the
+// silence after the last one, is an outage; when the agent reports every
+// minute, a bucket holding fewer minutes than it spans is a short one. Time
+// before the first row is left out rather than counted: the node may simply
+// not have existed yet.
+function availability(rows, step, start, end) {
+  if (!rows.length) return null;
+  const from = Math.max(start, rows[0].ts);
+  const gaps = rows.slice(1).map((r, i) => r.ts - rows[i].ts).sort((a, b) => a - b);
+  const cadence = gaps.length ? gaps[Math.floor(gaps.length / 2)] : step;
+  const tolerance = Math.max(step, cadence) * 1.5;
+  const unit = step / 60;
+  const fills = rows.slice(1, -1).map(r => Number(r.minutes || 0) / unit).sort((a, b) => a - b);
+  const everyMinute = fills.length > 0 && fills[Math.floor(fills.length / 2)] >= 0.9;
+  const missing = [];
+  rows.forEach((r, i) => {
+    const until = i + 1 < rows.length ? rows[i + 1].ts : end;
+    if (until - r.ts > tolerance) missing.push([r.ts + step, until]);
+    const held = Number(r.minutes || 0);
+    if (everyMinute && i > 0 && i < rows.length - 1 && held > 0 && held < unit) missing.push([r.ts + held * 60, r.ts + step]);
+  });
+  missing.sort((a, b) => a[0] - b[0]);
+  const spans = [];
+  for (const [a, b] of missing) {
+    const last = spans[spans.length - 1];
+    if (last && a - last[1] <= 60) last[1] = Math.max(last[1], b); else spans.push([a, b]);
+  }
+  const down = spans.reduce((sum, [a, b]) => sum + (b - a), 0);
+  const covered = Math.max(1, end - from);
+  const up = Math.max(0, 1 - down / covered) * 100;
+  const segs = 48, width = (end - start) / segs;
+  const cells = Array.from({ length: segs }, (_, i) => {
+    const a = start + i * width, b = a + width;
+    if (b <= from) return '<i class="nodata"></i>';
+    const lost = spans.reduce((sum, [s, e]) => sum + Math.max(0, Math.min(b, e) - Math.max(a, s)), 0);
+    const label = `${shortTime(a, 25)} – ${shortTime(b, 25)}`;
+    return lost > 0
+      ? `<i class="down" style="--lost:${Math.min(1, lost / width).toFixed(2)}" title="${escapeHtml(`${label} · 中断 ${duration(lost)}`)}"></i>`
+      : `<i title="${escapeHtml(`${label} · 正常`)}"></i>`;
+  }).join('');
+  const upText = up >= 100 ? '100%' : `${(Math.floor(up * 100) / 100).toFixed(2)}%`;
+  const summary = spans.length
+    ? `可用率 <strong class="${up < 99 ? 'danger' : 'warn'}">${upText}</strong><span class="avail-sep">·</span>中断 ${spans.length} 次，共 ${escapeHtml(duration(down))}`
+    : `可用率 <strong>${upText}</strong>`;
+  return `<div class="avail"><div class="avail-text">${summary}</div><div class="avail-strip">${cells}</div></div>`;
+}
+
+function historyWindow(hours) {
+  const end = Math.floor((state.detail.fetchedAt || Date.now()) / 1000);
+  return { start: end - hours * 3600, end, hours };
+}
+function resourceHistory(node, data) {
+  const hours = state.detail.hours.resources;
+  const step = Number(data?.step) || 60;
+  const win = historyWindow(hours);
+  const rows = (data?.metrics || []).map(r => ({ ...r, ts: Number(r.ts) })).filter(r => Number.isFinite(r.ts) && r.ts >= win.start - step).sort((a, b) => a.ts - b.ts);
+  if (!rows.length) return `<div class="chart-empty detail-no-data">${node.online ? '这段时间没有资源数据' : '节点离线，这段时间没有数据，可以切换到更长的时间范围'}</div>`;
+  const num = (r, k) => Number(r[k] || 0);
+  const m = node.online && node.metrics ? node.metrics : {};
+  const last = rows[rows.length - 1];
+  const now = (k) => Number(m[k] ?? last[k] ?? 0);
+  // Means are weighted by the minutes each bucket holds, as the hub's own are.
+  const avg = (get) => { let s = 0, w = 0; for (const r of rows) { const k = Number(r.minutes) || 1; s += get(r) * k; w += k; } return w ? s / w : 0; };
+  const peak = (get) => rows.reduce((hi, r) => Math.max(hi, get(r)), 0);
+  const base = { ...win, rows, step, height: 104 };
+  const k1 = (t) => `<span class="k primary">${t}</span>`, k2 = (t) => `<span class="k secondary">${t}</span>`;
+
+  const cpuOf = r => num(r, 'cpu'), cpuTop = r => Math.max(num(r, 'cpu'), num(r, 'cpu_max'));
+  const cpuPeak = peak(cpuTop);
+  const cpu = { ...base, id: 'c-cpu', name: 'CPU',
+    yMax: Math.min(100, Math.max(5, niceCeil(cpuPeak * 1.1))), yFormat: v => `${formatNumber(v, 0)}%`,
+    series: [{ get: cpuOf, band: r => [cpuOf(r), cpuTop(r)], tone: 'primary' }],
+    idle: `当前 ${pct(now('cpu'))} · 平均 ${pct(avg(cpuOf))} · 峰值 ${pct(cpuPeak)}`,
+    at: r => `${pct(cpuOf(r))}${cpuTop(r) > cpuOf(r) ? ` · 峰 ${pct(cpuTop(r))}` : ''}` };
+
+  const memTotal = Number(node.mem_total || m.mem_total || 0) || peak(r => num(r, 'mem_used')) * 1.2;
+  const swapTotal = Number(node.swap_total || m.swap_total || 0);
+  const memOf = r => num(r, 'mem_used');
+  const mem = { ...base, id: 'c-mem', name: '内存', yMax: memTotal || 1, yFormat: v => bytesShort(v),
+    series: [{ get: memOf, tone: 'primary' }, ...(swapTotal ? [{ get: r => num(r, 'swap_used'), tone: 'secondary' }] : [])],
+    idle: `当前 ${bytes(now('mem_used'))} · 平均 ${bytes(avg(memOf))} · 峰值 ${bytes(peak(memOf))}${swapTotal ? ` · ${k2('swap')} ${bytes(now('swap_used'))}` : ''}`,
+    at: r => `${bytes(memOf(r))}${swapTotal ? ` · ${k2('swap')} ${bytes(num(r, 'swap_used'))}` : ''}` };
+
+  const rx = r => num(r, 'net_rx'), tx = r => num(r, 'net_tx');
+  const rxTop = r => Math.max(rx(r), num(r, 'net_rx_max')), txTop = r => Math.max(tx(r), num(r, 'net_tx_max'));
+  const netMax = niceBytesCeil(Math.max(peak(r => Math.max(rxTop(r), txTop(r))), 1024) * 1.05);
+  const net = { ...base, id: 'c-net', name: '网络', yMax: netMax, scale: 'sqrt', yFormat: v => `${bytesShort(v)}/s`,
+    series: [{ get: rx, band: r => [rx(r), rxTop(r)], tone: 'primary' }, { get: tx, band: r => [tx(r), txTop(r)], tone: 'secondary' }],
+    idle: `${k1('↓')} 均 ${rate(avg(rx))} · 峰 ${rate(peak(rxTop))}<span class="read-gap"></span>${k2('↑')} 均 ${rate(avg(tx))} · 峰 ${rate(peak(txTop))}`,
+    at: r => `${k1('↓')} ${rate(rx(r))} · ${k2('↑')} ${rate(tx(r))}` };
+
+  const diskTotal = Number(node.disk_total || m.disk_total || 0) || peak(r => num(r, 'disk_used')) * 1.2;
+  const diskOf = r => num(r, 'disk_used');
+  const firstDisk = rows.find(r => diskOf(r) > 0);
+  const delta = firstDisk ? diskOf(last) - diskOf(firstDisk) : 0;
+  const disk = { ...base, id: 'c-disk', name: '硬盘', yMax: diskTotal || 1, yFormat: v => bytesShort(v),
+    series: [{ get: diskOf, tone: 'primary' }],
+    idle: `当前 ${bytes(now('disk_used'))} · 窗口内 ${delta >= 0 ? '+' : '−'}${bytes(Math.abs(delta))}`,
+    at: r => bytes(diskOf(r)) };
+
+  const tcp = r => num(r, 'tcp'), udp = r => num(r, 'udp');
+  const conn = { ...base, id: 'c-conn', name: '连接', yMax: niceCeil(Math.max(10, peak(r => Math.max(tcp(r), udp(r))) * 1.15)), yFormat: v => formatNumber(v, 0),
+    series: [{ get: tcp, tone: 'primary' }, { get: udp, tone: 'secondary' }],
+    idle: `${k1('TCP')} 当前 ${formatNumber(now('tcp'), 0)} · 峰值 ${formatNumber(peak(tcp), 0)}<span class="read-gap"></span>${k2('UDP')} 当前 ${formatNumber(now('udp'), 0)}`,
+    at: r => `${k1('TCP')} ${formatNumber(tcp(r), 0)} · ${k2('UDP')} ${formatNumber(udp(r), 0)}` };
+
+  const procs = r => num(r, 'procs');
+  const proc = { ...base, id: 'c-proc', name: '进程', yMax: niceCeil(Math.max(10, peak(procs) * 1.15)), yFormat: v => formatNumber(v, 0),
+    series: [{ get: procs, tone: 'primary' }],
+    idle: `当前 ${formatNumber(now('procs'), 0)} · 平均 ${formatNumber(avg(procs), 0)} · 峰值 ${formatNumber(peak(procs), 0)}`,
+    at: r => formatNumber(procs(r), 0) };
+
+  return `${availability(rows, step, win.start, win.end)}<div class="chart-grid">${[cpu, mem, net, disk, conn, proc].map(chartPanel).join('')}</div>`;
+}
+
+function laneStats(line) {
+  const vals = line.points.filter(p => p.latency !== null);
+  const avg = vals.length ? vals.reduce((s, p) => s + p.latency, 0) / vals.length : null;
+  const lo = vals.length ? Math.min(...vals.map(p => p.band ? p.band[0] : p.latency)) : null;
+  const hi = vals.length ? Math.max(...vals.map(p => p.band ? p.band[1] : p.latency)) : null;
+  let jitter = null;
+  if (vals.length > 1) jitter = vals.slice(1).reduce((s, p, i) => s + Math.abs(p.latency - vals[i].latency), 0) / (vals.length - 1);
+  return { ...latencyStats(line), avg, lo, hi, jitter };
+}
+function latencyHistory(data) {
+  const lines = normalizeLatency(data);
+  if (!lines.length) return '<div class="chart-empty detail-no-data">这段时间没有延迟数据</div>';
+  const hours = state.detail.hours.latency;
+  const step = Number(data?.step) || 60;
+  const win = historyWindow(hours);
+  const ms = v => v === null || v === undefined ? '—' : `${formatNumber(v, v < 10 ? 1 : 0)} ms`;
+  const stats = lines.map(laneStats);
+  const table = `<div class="lat-table-wrap"><table class="lat-table">
+    <thead><tr><th>线路</th><th>当前</th><th>平均</th><th>最低–最高</th><th>抖动</th><th>丢包</th></tr></thead>
+    <tbody>${lines.map((line, i) => {
+      const st = stats[i];
+      return `<tr><td>${escapeHtml(line.name)}</td><td class="${st.tone}">${st.latest === null ? '超时' : ms(st.latest)}</td><td>${ms(st.avg)}</td><td>${st.lo === null ? '—' : `${formatNumber(st.lo, 0)}–${formatNumber(st.hi, 0)} ms`}</td><td>${ms(st.jitter)}</td><td class="${st.lossTone}">${line.loss > 0 ? `${formatNumber(line.loss, line.loss < 1 ? 2 : 1)}%` : '—'}</td></tr>`;
+    }).join('')}</tbody></table></div>`;
+  const lanes = lines.map((line, i) => {
+    const st = stats[i];
+    // Each lane scales to its own line, with the same 20 ms floor the cards use,
+    // so a steady 170 ms route and a steady 30 ms one both read as flat.
+    let lo = st.lo ?? 0, hi = st.hi ?? 20;
+    if (hi - lo < 20) { const mid = (lo + hi) / 2; lo = mid - 10; hi = mid + 10; }
+    const pad = (hi - lo) * 0.1;
+    const rows = line.points;
+    return chartPanel({ ...win, id: `c-lat-${line.id}`, name: line.name, rows, step, height: 72,
+      yMin: Math.max(0, Math.floor(lo - pad)), yMax: Math.ceil(hi + pad), yFormat: v => `${formatNumber(v, 0)} ms`,
+      series: [{ get: p => p.latency, band: p => p.band || [p.latency, p.latency], tone: 'primary' }],
+      drops: rows.filter(p => p.loss > 0 || p.latency === null),
+      idle: `均 ${ms(st.avg)} · 抖动 ${ms(st.jitter)}${line.loss > 0 ? ` · <span class="${st.lossTone || 'muted'}">丢 ${formatNumber(line.loss, line.loss < 1 ? 2 : 1)}%</span>` : ''}`,
+      at: p => p.latency === null ? '<span class="danger">超时</span>' : `${ms(p.latency)}${p.band ? `（${p.band[0]}–${p.band[1]}）` : ''}${p.loss > 0 ? ` · <span class="danger">丢 ${p.loss}%</span>` : ''}` });
+  }).join('');
+  return `${table}<div class="lat-lanes">${lanes}</div>`;
 }
 
 function detailTabs() {
   const t = state.detail.tab;
+  const ranges = detailRanges(t);
+  if (!ranges.some(([h]) => h === state.detail.hours[t])) state.detail.hours[t] = ranges[ranges.length - 1][0];
   const hours = state.detail.hours[t];
-  const ranges = t === 'latency' ? [1,6,24] : [1,6,24,168];
-  return `<div class="detail-controls"><div class="segmented"><button class="seg-btn ${t==='resources'?'active':''}" data-detail-tab="resources">资源</button><button class="seg-btn ${t==='latency'?'active':''}" data-detail-tab="latency">网络延迟</button></div><div class="segmented">${ranges.map(h=>`<button class="seg-btn ${hours===h?'active':''}" data-detail-hours="${h}">${h===168?'7 天':`${h} 小时`}</button>`).join('')}</div></div>`;
-}
-
-function detailTitleInner(node) {
-  const m = node.metrics || {};
-  const r = region(node);
-  const os = shortOS(node.os);
-  const status = node.online ? `运行 ${duration(m.uptime)}` : '离线';
-  const meta = [r, os].filter(Boolean).map(escapeHtml);
-  meta.push(`<span class="${node.online ? '' : 'is-offline'}">${escapeHtml(status)}</span>`);
-  return `<h1>${escapeHtml(node.name)}</h1><span class="detail-meta">${meta.join(' · ')}</span>`;
-}
-function detailFactsHtml(node) {
-  const m = node.metrics || {};
-  const os = shortOS(node.os);
-  const system = [os, node.kernel].filter(Boolean).join(' · ');
-  const cpu = node.cpu_name ? `${cpuName(node.cpu_name)} × ${node.cpu_cores || 0}` : `${node.cpu_cores || 0} 核`;
-  const network = `↓ ${bytes(node.day_rx || 0)} · ↑ ${bytes(node.day_tx || 0)}`;
-  const totalNetwork = `↓ ${bytes(node.total_rx || 0)} · ↑ ${bytes(node.total_tx || 0)}`;
-  const address = [node.ipv4 || node.ip, node.ipv6].filter(Boolean).join(' · ');
-  return `${fact('系统', system)}
-    ${fact('CPU', cpu)}
-    ${fact('内存 / 硬盘', `${bytes(node.mem_total || 0)} / ${bytes(node.disk_total || 0)}`)}
-    ${fact('实时资源', m ? `CPU ${pct(m.cpu || 0)} · 内存 ${pct((m.mem_total||node.mem_total)?(m.mem_used||0)/(m.mem_total||node.mem_total)*100:0)}` : '—')}
-    ${fact('今日流量', network)}
-    ${fact('累计流量', totalNetwork)}
-    ${fact('续费', detailPrice(node))}
-    ${address ? fact('地址', address) : ''}
-    ${m?.procs != null ? fact('连接 / 进程', `TCP ${m.tcp || 0} · UDP ${m.udp || 0} · ${m.procs || 0} 进程`) : ''}`;
+  return `<div class="detail-controls"><div class="segmented"><button class="seg-btn ${t==='resources'?'active':''}" data-detail-tab="resources">资源</button><button class="seg-btn ${t==='latency'?'active':''}" data-detail-tab="latency">网络延迟</button></div><div class="segmented">${ranges.map(([h, label]) => `<button class="seg-btn ${hours===h?'active':''}" data-detail-hours="${h}">${label}</button>`).join('')}</div></div>`;
 }
 function detailHistoryBody(node) {
-  let historyBody = '<div class="chart-empty detail-no-data">正在读取历史数据…</div>';
-  if (state.detail.error) historyBody = `<div class="chart-empty detail-no-data error">读取历史数据失败：${escapeHtml(state.detail.error)}</div>`;
-  else if (!state.detail.loading && state.detail.data) historyBody = state.detail.tab === 'latency' ? renderLatencyHistory(state.detail.data) : renderResourceHistory(node, state.detail.data);
-  return `${detailTabs()}${historyBody}`;
+  let body = '<div class="chart-empty detail-no-data">正在读取历史数据…</div>';
+  if (state.detail.data) body = state.detail.tab === 'latency' ? latencyHistory(state.detail.data) : resourceHistory(node, state.detail.data);
+  else if (state.detail.error) body = `<div class="chart-empty detail-no-data error"><div>读取历史数据失败：${escapeHtml(state.detail.error)}<button class="inline-link" data-detail-retry>重试</button></div></div>`;
+  return `${detailTabs()}${body}`;
 }
 function renderDetail(node) {
   return `<section class="detail-page">
     <div class="detail-nav"><button class="back-btn" data-home>${icon('arrowLeft')}<span>返回节点</span></button></div>
-    <div class="detail-title-line">${detailTitleInner(node)}</div>
-    <dl class="detail-facts">${detailFactsHtml(node)}</dl>
+    <div class="detail-head">${detailHeadInner(node)}</div>
+    <div class="detail-live">${detailLiveInner(node)}</div>
+    <div class="detail-specs">${detailSpecsInner(node)}</div>
     ${node.remark ? `<div class="detail-remark">${escapeHtml(node.remark).replace(/\n/g,'<br>')}</div>` : ''}
     <div class="detail-history">${detailHistoryBody(node)}</div>
   </section>`;
+}
+// Redraws only the history section: tab and range switches and data arrivals
+// leave the live band, the specs and the scroll position alone.
+function renderDetailHistory() {
+  const host = document.querySelector('.detail-history');
+  const node = sortedNodes().find(n => Number(n.id) === Number(state.routeNodeId));
+  if (!host || !node) return render();
+  state.chartRegistry = new Map();
+  host.innerHTML = detailHistoryBody(node);
+  bindDetailCharts();
 }
 
 function activeSelection() {
@@ -1033,15 +1261,12 @@ function patchDetailLive() {
   const page = document.querySelector('.detail-page');
   const node = sortedNodes().find(n => Number(n.id) === Number(state.routeNodeId));
   if (!page || !node) return false;
-  const title = page.querySelector('.detail-title-line');
-  const facts = page.querySelector('.detail-facts');
-  if (title) {
-    const freshTitle = parseElement(`<div class="detail-title-line">${detailTitleInner(node)}</div>`);
-    if (!freshTitle || !patchRoot(title, freshTitle)) return false;
-  }
-  if (facts) {
-    const freshFacts = parseElement(`<dl class="detail-facts">${detailFactsHtml(node)}</dl>`);
-    if (!freshFacts || !patchRoot(facts, freshFacts)) return false;
+  // The history section is not live: it redraws on its own schedule.
+  for (const [cls, inner] of [['detail-head', detailHeadInner], ['detail-live', detailLiveInner], ['detail-specs', detailSpecsInner]]) {
+    const current = page.querySelector(`.${cls}`);
+    if (!current) continue;
+    const fresh = parseElement(`<div class="${cls}">${inner(node)}</div>`);
+    if (!fresh || !patchRoot(current, fresh)) return false;
   }
   document.title = `${node.name || ''} · ${state.me?.site_name || 'Monitor'}`;
   return true;
@@ -1120,49 +1345,10 @@ function render() {
     ? `${sortedNodes().find(n=>Number(n.id)===Number(state.routeNodeId))?.name || ''} · ${state.me?.site_name || 'Monitor'}`
     : (state.me?.site_name || 'Monitor');
   bindGlobal();
-  bindHistoryCharts();
+  bindDetailCharts();
   observeLatencyTargets();
   state.statusChanged.clear();
   if (state.routeNodeId !== null) ensureDetailData();
-}
-
-function bindHistoryCharts() {
-  document.querySelectorAll('.history-chart[data-chart-id]').forEach(chart => {
-    const model = state.chartRegistry.get(chart.dataset.chartId);
-    const svg = chart.querySelector('svg');
-    const hit = chart.querySelector('.chart-hitbox');
-    const line = chart.querySelector('.chart-hover-line');
-    const tooltip = chart.querySelector('.chart-tooltip');
-    if (!model || !svg || !hit || !line || !tooltip) return;
-    const hide = () => { line.style.opacity = '0'; tooltip.classList.remove('show'); };
-    const move = (ev) => {
-      const rect = svg.getBoundingClientRect();
-      if (!rect.width) return;
-      const local = Math.max(0, Math.min(rect.width, ev.clientX - rect.left));
-      const targetTs = model.minTs + local / rect.width * (model.maxTs - model.minTs);
-      const x = model.maxTs === model.minTs ? 0 : (targetTs - model.minTs) / (model.maxTs - model.minTs) * 1000;
-      line.setAttribute('x1', x.toFixed(2)); line.setAttribute('x2', x.toFixed(2)); line.style.opacity = '1';
-      const values = [];
-      let displayTs = targetTs;
-      for (const s of model.series) {
-        const near = nearestSeriesValue(model.rows, s.get, targetTs);
-        if (!near) continue;
-        displayTs = near.row.ts;
-        const text = s.format ? s.format(near.value, near.row) : formatNumber(near.value, 2);
-        values.push(`<div class="chart-tooltip-row"><span>${escapeHtml(s.label || '值')}</span><strong>${escapeHtml(text)}</strong></div>`);
-      }
-      if (!values.length) return hide();
-      tooltip.innerHTML = `<time>${escapeHtml(new Date(displayTs).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}))}</time>${values.join('')}`;
-      tooltip.classList.add('show');
-      const tooltipWidth = 190;
-      const px = local;
-      tooltip.style.left = `${Math.max(8, Math.min(rect.width - tooltipWidth - 8, px + 12))}px`;
-      tooltip.style.top = '8px';
-    };
-    hit.addEventListener('pointermove', move);
-    hit.addEventListener('pointerenter', move);
-    hit.addEventListener('pointerleave', hide);
-  });
 }
 
 function bindGlobal() {
@@ -1172,16 +1358,6 @@ function bindGlobal() {
   }));
   document.querySelectorAll('[data-region]').forEach(btn => btn.addEventListener('click', () => { state.filter = btn.dataset.region; render(); }));
   document.querySelectorAll('[data-view]').forEach(btn => btn.addEventListener('click', () => { state.view = btn.dataset.view; localStorage.setItem('quiet-noc-view', state.view); render(); }));
-  document.querySelectorAll('[data-detail-tab]').forEach(btn => btn.addEventListener('click', () => {
-    state.detail.tab = btn.dataset.detailTab;
-    state.detail.key = ''; state.detail.data = null; state.detail.error = '';
-    render();
-  }));
-  document.querySelectorAll('[data-detail-hours]').forEach(btn => btn.addEventListener('click', () => {
-    state.detail.hours[state.detail.tab] = Number(btn.dataset.detailHours);
-    state.detail.key = ''; state.detail.data = null; state.detail.error = '';
-    render();
-  }));
   $('#themeToggle')?.addEventListener('click', () => {
     const current = document.documentElement.dataset.theme;
     state.theme = current === 'dark' ? 'light' : 'dark';
@@ -1222,56 +1398,92 @@ document.addEventListener('auxclick', (e) => {
   window.open(`/node/${t.id}`, '_blank', 'noopener');
 });
 
+// Delegated because the history section, controls included, is redrawn on its own.
+document.addEventListener('click', (e) => {
+  const tab = e.target.closest?.('[data-detail-tab]');
+  const range = e.target.closest?.('[data-detail-hours]');
+  const retry = e.target.closest?.('[data-detail-retry]');
+  if (!tab && !range && !retry) return;
+  // Re-picking the current choice does nothing, unless the last request failed.
+  const same = retry || (tab ? tab.dataset.detailTab === state.detail.tab : Number(range.dataset.detailHours) === state.detail.hours[state.detail.tab]);
+  if (same && !retry && (state.detail.data || state.detail.loading)) return;
+  if (tab) state.detail.tab = tab.dataset.detailTab;
+  else if (range) state.detail.hours[state.detail.tab] = Number(range.dataset.detailHours);
+  resetDetailData();
+  renderDetailHistory();
+  ensureDetailData();
+});
+
 function readNodeRoute() {
   const m = location.pathname.match(/^\/node\/(\d+)/);
   return m ? Number(m[1]) : null;
 }
+function resetDetailData() {
+  clearTimeout(state.detail.refreshTimer);
+  state.detail.key = ''; state.detail.data = null; state.detail.error = ''; state.detail.fetchedAt = 0;
+}
 function goNode(id) {
   history.pushState({}, '', `/node/${id}`);
   state.routeNodeId = id;
-  state.detail.key = ''; state.detail.data = null; state.detail.error = '';
+  resetDetailData();
   scrollTo(0, 0);
   render();
 }
 function goHome() {
   if (location.pathname !== '/') history.pushState({}, '', '/');
   state.routeNodeId = null;
-  state.detail.key = ''; state.detail.data = null; state.detail.error = '';
+  resetDetailData();
   scrollTo(0, 0);
   render();
 }
 addEventListener('popstate', () => {
   state.routeNodeId = readNodeRoute();
-  state.detail.key = ''; state.detail.data = null; state.detail.error = '';
+  resetDetailData();
   render();
 });
 
-async function ensureDetailData() {
+// `silent` refreshes the hour window in place: the current charts stay up while
+// the request runs, and a failure keeps them rather than replacing them.
+async function ensureDetailData(silent = false) {
   if (state.routeNodeId === null) return;
   const tab = state.detail.tab;
   const hours = state.detail.hours[tab];
   const key = `${state.routeNodeId}:${tab}:${hours}`;
-  if (state.detail.key === key && (state.detail.loading || state.detail.data)) return;
+  if (!silent && state.detail.key === key && (state.detail.loading || state.detail.data)) return;
+  clearTimeout(state.detail.refreshTimer);
   state.detail.key = key;
   state.detail.loading = true;
-  state.detail.error = '';
   const series = tab === 'latency' ? 'ping' : 'metrics';
-  const points = Math.max(240, Math.round(innerWidth * (devicePixelRatio || 1)));
+  // As many points as one panel is wide: resource panels sit two to a row on desktop.
+  const panel = Math.min(innerWidth, 1580) / (tab === 'resources' && innerWidth > 1100 ? 2 : 1);
+  const points = Math.max(240, Math.min(1440, Math.round(panel * (devicePixelRatio || 1))));
   try {
     const res = await fetch(`/api/nodes/${state.routeNodeId}/metrics?hours=${hours}&points=${points}&series=${series}`, { credentials:'same-origin', cache:'no-store' });
     if (!res.ok) throw new Error((await res.text()) || `${res.status} ${res.statusText}`);
     const data = await res.json();
     if (state.detail.key !== key) return;
     state.detail.data = data;
+    state.detail.fetchedAt = Date.now();
+    state.detail.error = '';
   } catch (e) {
     if (state.detail.key !== key) return;
-    state.detail.error = e?.message || '网络错误';
+    if (!silent || !state.detail.data) state.detail.error = e?.message || '网络错误';
   } finally {
     if (state.detail.key === key) {
       state.detail.loading = false;
-      render();
+      renderDetailHistory();
+      if (hours === 1) scheduleDetailRefresh(key);
     }
   }
+}
+// The hour window follows the clock: redrawn each minute while the page is visible.
+function scheduleDetailRefresh(key) {
+  clearTimeout(state.detail.refreshTimer);
+  state.detail.refreshTimer = setTimeout(() => {
+    if (state.detail.key !== key) return;
+    if (document.hidden) return scheduleDetailRefresh(key);
+    ensureDetailData(true);
+  }, 60000);
 }
 
 function accept(raw) {
